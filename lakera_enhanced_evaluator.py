@@ -71,26 +71,30 @@ class SimpleGroundTruthParser:
         if isinstance(label, str):
             label_lower = label.lower().strip()
             
-            # JBB harmful categories - all should be THREAT
-            harmful_indicators = [
-                'harassment', 'discrimination', 'hate', 'violence', 'harm',
-                'malware', 'hacking', 'fraud', 'deception', 'economic',
-                'sexual', 'adult', 'privacy', 'disinformation', 'expert',
-                'government', 'physical', 'defamation', 'shaming', 'xenophobia'
+            # Jailbreak/adversarial indicators (these are THREATS)
+            threat_indicators = [
+                'jailbreak', 'adversarial', 'attack', 'prompt_injection', 'injection',
+                'harmful', 'dangerous', 'toxic', 'malicious', 'threatening', 'violent',
+                'inappropriate', 'unsafe', 'illegal', 'criminal', 'unethical',
+                'true', 'yes', '1', 'positive', 'threat'
             ]
             
-            # Check if any harmful indicator is in the label
-            for indicator in harmful_indicators:
+            # Safe/benign indicators (these are SAFE)
+            safe_indicators = [
+                'benign', 'safe', 'harmless', 'acceptable', 'appropriate', 'ethical',
+                'legal', 'legitimate', 'allowed', 'clean', 'wholesome', 'normal',
+                'false', 'no', '0', 'negative'
+            ]
+            
+            # Check for threat indicators
+            for indicator in threat_indicators:
                 if indicator in label_lower:
                     return True
             
-            # Traditional threat indicators
-            if any(word in label_lower for word in ['true', 'yes', '1', 'positive', 'threat']):
-                return True
-            
-            # Safe indicators
-            if any(word in label_lower for word in ['safe', 'false', 'no', '0', 'negative']):
-                return False
+            # Check for safe indicators
+            for indicator in safe_indicators:
+                if indicator in label_lower:
+                    return False
         
         return None
 
@@ -299,7 +303,7 @@ async def process_dataset_simple(file_path: str, api_key: str,
                                text_column: Optional[str] = None,
                                label_column: Optional[str] = None,
                                max_rows: int = None):
-    """Simple dataset processing"""
+    """Simple dataset processing with enhanced file format support"""
     
     logger.info(f"📁 Loading dataset: {file_path}")
     
@@ -309,7 +313,7 @@ async def process_dataset_simple(file_path: str, api_key: str,
         
         # Suggest similar files
         parent_dir = Path(file_path).parent
-        similar_files = list(parent_dir.glob("*jbb*"))
+        similar_files = list(parent_dir.glob(f"*{Path(file_path).stem}*"))
         if similar_files:
             logger.info("🔍 Similar files found:")
             for f in similar_files:
@@ -317,21 +321,163 @@ async def process_dataset_simple(file_path: str, api_key: str,
         
         return False
     
-    # Load data
+    # Determine file format and load data
+    file_ext = Path(file_path).suffix.lower()
+    logger.info(f"📄 File format: {file_ext}")
+    
     try:
-        if file_path.endswith('.csv'):
+        if file_ext == '.csv':
             df = pd.read_csv(file_path)
-        elif file_path.endswith('.parquet'):
-            df = pd.read_parquet(file_path)
+            logger.info("✅ CSV file loaded successfully")
+            
+        elif file_ext == '.parquet':
+            # Enhanced Parquet loading with error handling
+            try:
+                # Try with pandas first
+                df = pd.read_parquet(file_path)
+                logger.info("✅ Parquet file loaded with pandas")
+            except Exception as pandas_error:
+                logger.warning(f"⚠️ Pandas failed: {pandas_error}")
+                
+                # Try with pyarrow directly if available
+                try:
+                    import pyarrow.parquet as pq
+                    table = pq.read_table(file_path)
+                    df = table.to_pandas()
+                    logger.info("✅ Parquet file loaded with pyarrow")
+                except ImportError:
+                    logger.error("❌ pyarrow not available. Install with: pip install pyarrow")
+                    return False
+                except Exception as pyarrow_error:
+                    logger.error(f"❌ PyArrow failed: {pyarrow_error}")
+                    
+                    # Try alternative approach - read as bytes and diagnose
+                    try:
+                        file_size = Path(file_path).stat().st_size
+                        logger.info(f"📊 File size: {file_size} bytes")
+                        
+                        # Read first few bytes to check format
+                        with open(file_path, 'rb') as f:
+                            header = f.read(16)
+                            logger.info(f"🔍 File header (hex): {header.hex()}")
+                            logger.info(f"🔍 File header (ascii): {header}")
+                        
+                        # Check if it's actually a different format
+                        if b'PAR1' not in header and b'parquet' not in header.lower():
+                            logger.error("❌ File doesn't appear to be a valid Parquet file")
+                            logger.info("💡 Try converting to CSV or check file integrity")
+                        else:
+                            logger.error("❌ Parquet file appears valid but cannot be read")
+                    except Exception as diag_error:
+                        logger.error(f"❌ Cannot diagnose file: {diag_error}")
+                    
+                    return False
+            
+        elif file_ext == '.jsonl':
+            # Enhanced JSONL loading
+            logger.info("📋 Loading JSONL file...")
+            data = []
+            line_count = 0
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if line:
+                            try:
+                                json_obj = json.loads(line)
+                                data.append(json_obj)
+                                line_count += 1
+                                
+                                # Progress for large files
+                                if line_count % 10000 == 0:
+                                    logger.info(f"   Loaded {line_count:,} lines...")
+                                    
+                            except json.JSONDecodeError as json_err:
+                                logger.warning(f"⚠️ Skipping invalid JSON on line {line_num}: {json_err}")
+                                continue
+                
+                if not data:
+                    logger.error("❌ No valid JSON objects found in JSONL file")
+                    return False
+                
+                df = pd.DataFrame(data)
+                logger.info(f"✅ JSONL file loaded: {line_count:,} records")
+                
+            except UnicodeDecodeError:
+                # Try different encodings
+                for encoding in ['latin-1', 'cp1252', 'iso-8859-1']:
+                    try:
+                        logger.info(f"🔄 Trying encoding: {encoding}")
+                        with open(file_path, 'r', encoding=encoding) as f:
+                            data = []
+                            for line in f:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        data.append(json.loads(line))
+                                    except json.JSONDecodeError:
+                                        continue
+                        
+                        if data:
+                            df = pd.DataFrame(data)
+                            logger.info(f"✅ JSONL loaded with {encoding} encoding")
+                            break
+                    except Exception:
+                        continue
+                else:
+                    logger.error("❌ Could not decode JSONL file with any encoding")
+                    return False
+        
+        elif file_ext == '.json':
+            # Regular JSON file
+            logger.info("📋 Loading JSON file...")
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                
+                # Handle different JSON structures
+                if isinstance(json_data, list):
+                    df = pd.DataFrame(json_data)
+                elif isinstance(json_data, dict):
+                    # Check if it's a nested structure
+                    if 'data' in json_data:
+                        df = pd.DataFrame(json_data['data'])
+                    elif 'rows' in json_data:
+                        df = pd.DataFrame(json_data['rows'])
+                    else:
+                        # Try to convert dict to single-row DataFrame
+                        df = pd.DataFrame([json_data])
+                else:
+                    logger.error("❌ Unsupported JSON structure")
+                    return False
+                
+                logger.info("✅ JSON file loaded successfully")
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Invalid JSON format: {e}")
+                return False
+        
         else:
-            logger.error(f"❌ Unsupported file format: {file_path}")
+            logger.error(f"❌ Unsupported file format: {file_ext}")
+            logger.info("💡 Supported formats: .csv, .parquet, .jsonl, .json")
             return False
         
         logger.info(f"✅ Dataset loaded: {df.shape}")
         logger.info(f"   Columns: {list(df.columns)}")
         
+        # Show data types
+        logger.info("📊 Column types:")
+        for col, dtype in df.dtypes.items():
+            logger.info(f"   {col}: {dtype}")
+        
     except Exception as e:
         logger.error(f"❌ Error loading dataset: {e}")
+        logger.error("💡 Troubleshooting tips:")
+        logger.error("   - Check file isn't corrupted")
+        logger.error("   - Try opening in a text editor to verify format")
+        logger.error("   - For Parquet: pip install pyarrow")
+        logger.error("   - Consider converting to CSV format")
         return False
     
     # Detect columns
@@ -339,31 +485,122 @@ async def process_dataset_simple(file_path: str, api_key: str,
         detected_text_col = text_column
         logger.info(f"✅ Using specified text column: {detected_text_col}")
     else:
-        # Auto-detect
-        text_candidates = ['Goal', 'text', 'prompt', 'content', 'message']
+        # Enhanced auto-detection for different formats
+        text_candidates = [
+            # Common in datasets
+            'prompt', 'text', 'content', 'message', 'input', 'query', 'goal', 'instruction',
+            # HuggingFace datasets
+            'conversations', 'chat', 'dialogue', 'messages',
+            # Safety datasets  
+            'question', 'user_input', 'request', 'task'
+        ]
+        
         detected_text_col = None
+        
+        # Exact matches first
         for candidate in text_candidates:
-            if candidate in df.columns:
-                detected_text_col = candidate
-                logger.info(f"✅ Auto-detected text column: {detected_text_col}")
+            for col in df.columns:
+                if candidate.lower() == col.lower():
+                    detected_text_col = col
+                    logger.info(f"✅ Auto-detected text column: {detected_text_col} (exact match)")
+                    break
+            if detected_text_col:
                 break
         
+        # Partial matches if no exact match
         if not detected_text_col:
-            logger.error(f"❌ No text column found. Available: {list(df.columns)}")
+            for candidate in text_candidates:
+                for col in df.columns:
+                    if candidate.lower() in col.lower():
+                        detected_text_col = col
+                        logger.info(f"✅ Auto-detected text column: {detected_text_col} (partial match)")
+                        break
+                if detected_text_col:
+                    break
+        
+        # Find by content length if still not found
+        if not detected_text_col:
+            text_candidates_by_length = []
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    # Check if column contains text-like data
+                    sample_data = df[col].dropna().head(10)
+                    if len(sample_data) > 0:
+                        avg_length = sample_data.astype(str).str.len().mean()
+                        max_length = sample_data.astype(str).str.len().max()
+                        
+                        # Likely text if average > 50 chars and max > 100 chars
+                        if avg_length > 50 and max_length > 100:
+                            text_candidates_by_length.append((col, avg_length))
+                            logger.info(f"📝 Text candidate: '{col}' (avg: {avg_length:.1f}, max: {max_length})")
+            
+            if text_candidates_by_length:
+                detected_text_col = max(text_candidates_by_length, key=lambda x: x[1])[0]
+                logger.info(f"✅ Auto-detected text column: {detected_text_col} (by length)")
+        
+        if not detected_text_col:
+            logger.error(f"❌ No text column found. Available columns: {list(df.columns)}")
+            logger.info("💡 Specify text column with --text-column parameter")
             return False
     
+    # Enhanced label column detection
     if label_column and label_column in df.columns:
         detected_label_col = label_column
         logger.info(f"✅ Using specified label column: {detected_label_col}")
     else:
-        # Auto-detect
-        label_candidates = ['Category', 'label', 'ground_truth', 'class']
+        # Enhanced auto-detection for labels
+        label_candidates = [
+            # Standard ML terms
+            'type', 'label', 'labels', 'ground_truth', 'groundtruth', 'gt', 'class', 'category', 
+            'classification', 'target', 'y', 'output',
+            # Safety/jailbreak specific
+            'is_safe', 'safety', 'risk', 'harmful', 'toxicity', 'jailbreak', 'adversarial',
+            # Behavior analysis
+            'behavior', 'behaviour', 'intent', 'malicious', 'benign'
+        ]
+        
         detected_label_col = None
+        
+        # Exact matches first
         for candidate in label_candidates:
-            if candidate in df.columns:
-                detected_label_col = candidate
-                logger.info(f"✅ Auto-detected label column: {detected_label_col}")
+            for col in df.columns:
+                if candidate.lower() == col.lower():
+                    detected_label_col = col
+                    logger.info(f"✅ Auto-detected label column: {detected_label_col} (exact match)")
+                    break
+            if detected_label_col:
                 break
+        
+        # Partial matches
+        if not detected_label_col:
+            for candidate in label_candidates:
+                for col in df.columns:
+                    if candidate.lower() in col.lower():
+                        detected_label_col = col
+                        logger.info(f"✅ Auto-detected label column: {detected_label_col} (partial match)")
+                        break
+                if detected_label_col:
+                    break
+        
+        # Analyze columns by content if still not found
+        if not detected_label_col:
+            for col in df.columns:
+                if col != detected_text_col and df[col].dtype == 'object':
+                    unique_values = df[col].dropna().unique()
+                    if 2 <= len(unique_values) <= 10:  # Reasonable number of categories
+                        logger.info(f"🎯 Potential label column: '{col}' with values: {list(unique_values)}")
+                        
+                        # Check if values look like labels
+                        label_like_score = 0
+                        for value in unique_values:
+                            value_str = str(value).lower()
+                            if any(term in value_str for term in ['safe', 'unsafe', 'jailbreak', 'benign', 'harmful', 'true', 'false', '0', '1']):
+                                label_like_score += 1
+                        
+                        if label_like_score > 0:
+                            detected_label_col = col
+                            logger.info(f"✅ Auto-detected label column: {detected_label_col} (by content)")
+                            break
     
     # Analyze ground truth
     ground_truth = []
