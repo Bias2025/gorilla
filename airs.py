@@ -659,7 +659,7 @@ def calculate_confusion_matrix(
     predicted_labels: List[str], 
     true_labels: List[str]
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Calculate confusion matrix and performance metrics."""
+    """Calculate confusion matrix and simplified performance metrics."""
     # Handle cases where true_labels might contain None values
     filtered_pairs = [(p, t) for p, t in zip(predicted_labels, true_labels) if t is not None]
     
@@ -673,30 +673,32 @@ def calculate_confusion_matrix(
         # Create confusion matrix
         cm = confusion_matrix(filtered_true, filtered_pred, labels=["benign", "malicious"])
         
-        # Calculate metrics
+        # Calculate overall metrics (weighted averages)
         accuracy = accuracy_score(filtered_true, filtered_pred)
         precision, recall, f1, support = precision_recall_fscore_support(
+            filtered_true, filtered_pred, labels=["benign", "malicious"], average="weighted", zero_division=0
+        )
+        
+        # Also get macro averages for comparison
+        precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+            filtered_true, filtered_pred, labels=["benign", "malicious"], average="macro", zero_division=0
+        )
+        
+        # Get total support counts
+        _, _, _, support_per_class = precision_recall_fscore_support(
             filtered_true, filtered_pred, labels=["benign", "malicious"], average=None, zero_division=0
         )
         
-        # Calculate macro averages
-        macro_precision = np.mean(precision)
-        macro_recall = np.mean(recall)
-        macro_f1 = np.mean(f1)
-        
         metrics = {
             "accuracy": accuracy,
-            "precision_benign": precision[0] if len(precision) > 0 else 0,
-            "precision_malicious": precision[1] if len(precision) > 1 else 0,
-            "recall_benign": recall[0] if len(recall) > 0 else 0,
-            "recall_malicious": recall[1] if len(recall) > 1 else 0,
-            "f1_benign": f1[0] if len(f1) > 0 else 0,
-            "f1_malicious": f1[1] if len(f1) > 1 else 0,
-            "macro_precision": macro_precision,
-            "macro_recall": macro_recall,
-            "macro_f1": macro_f1,
-            "support_benign": support[0] if len(support) > 0 else 0,
-            "support_malicious": support[1] if len(support) > 1 else 0,
+            "precision": precision,  # Weighted average precision
+            "recall": recall,        # Weighted average recall  
+            "f1_score": f1,         # Weighted average F1-score
+            "precision_macro": precision_macro,  # Macro average (for reference)
+            "recall_macro": recall_macro,        # Macro average (for reference)
+            "f1_macro": f1_macro,               # Macro average (for reference)
+            "support_benign": support_per_class[0] if len(support_per_class) > 0 else 0,
+            "support_malicious": support_per_class[1] if len(support_per_class) > 1 else 0,
             "total_samples": len(filtered_pairs)
         }
         
@@ -968,16 +970,12 @@ async def retrieve_and_display_results(
                 ["=== PERFORMANCE METRICS ==="],
                 ["Metric", "Value"],
                 ["Accuracy", f"{performance_metrics['accuracy']:.3f}"],
-                ["Precision (Benign)", f"{performance_metrics['precision_benign']:.3f}"],
-                ["Precision (Malicious)", f"{performance_metrics['precision_malicious']:.3f}"],
-                ["Recall (Benign)", f"{performance_metrics['recall_benign']:.3f}"],
-                ["Recall (Malicious)", f"{performance_metrics['recall_malicious']:.3f}"],
-                ["F1-Score (Benign)", f"{performance_metrics['f1_benign']:.3f}"],
-                ["F1-Score (Malicious)", f"{performance_metrics['f1_malicious']:.3f}"],
-                ["Macro F1-Score", f"{performance_metrics['macro_f1']:.3f}"],
+                ["Precision", f"{performance_metrics['precision']:.3f}"],
+                ["Recall", f"{performance_metrics['recall']:.3f}"],
+                ["F1-Score", f"{performance_metrics['f1_score']:.3f}"],
+                ["Total Samples with Ground Truth", int(performance_metrics['total_samples'])],
                 ["Support (Benign)", int(performance_metrics['support_benign'])],
                 ["Support (Malicious)", int(performance_metrics['support_malicious'])],
-                ["Total Samples with Ground Truth", int(performance_metrics['total_samples'])],
                 [""],
             ])
             
@@ -1143,13 +1141,9 @@ def display_scan_results(
         print(SUBDIV)
         perf_data = [
             ["Accuracy", f"{performance_metrics['accuracy']:.3f}"],
-            ["Precision (Benign)", f"{performance_metrics['precision_benign']:.3f}"],
-            ["Precision (Malicious)", f"{performance_metrics['precision_malicious']:.3f}"],
-            ["Recall (Benign)", f"{performance_metrics['recall_benign']:.3f}"],
-            ["Recall (Malicious)", f"{performance_metrics['recall_malicious']:.3f}"],
-            ["F1-Score (Benign)", f"{performance_metrics['f1_benign']:.3f}"],
-            ["F1-Score (Malicious)", f"{performance_metrics['f1_malicious']:.3f}"],
-            ["Macro F1-Score", f"{performance_metrics['macro_f1']:.3f}"],
+            ["Precision", f"{performance_metrics['precision']:.3f}"],
+            ["Recall", f"{performance_metrics['recall']:.3f}"],
+            ["F1-Score", f"{performance_metrics['f1_score']:.3f}"],
         ]
         print(tabulate(
             perf_data,
