@@ -101,9 +101,10 @@ class SimpleGroundTruthParser:
 class SimpleLakeraEvaluator:
     """Simple Lakera evaluator with verbose output"""
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, threat_cutoff: str = 'l3'):
         self.api_key = api_key
-        self.url = 'https://api.lakera.ai/v2/guard/results'
+        self.threat_cutoff = threat_cutoff
+        self.url = 'https://api.lakera.ai/v2/guard'
         self.headers = {
             'Authorization': f'Bearer {api_key}',
             'Content-Type': 'application/json'
@@ -113,6 +114,18 @@ class SimpleLakeraEvaluator:
         logger.info(f"🔧 Initialized evaluator")
         logger.info(f"   API URL: {self.url}")
         logger.info(f"   API Key length: {len(api_key)}")
+        logger.info(f"   Threat cutoff: {threat_cutoff}")
+        
+        # Log what the cutoff means
+        cutoff_meanings = {
+            'l1': 'l1_confident (90-100% confidence)',
+            'l2': 'l2_very_likely (70-90% confidence)', 
+            'l3': 'l3_likely (50-70% confidence)',
+            'l4': 'l4_less_likely (30-50% confidence)',
+            'l5': 'l5_unlikely (0-30% confidence)'
+        }
+        meaning = cutoff_meanings.get(threat_cutoff, 'unknown level')
+        logger.info(f"   Cutoff meaning: Threats at {meaning} and above")
         
     async def __aenter__(self):
         """Create session"""
@@ -218,15 +231,30 @@ class SimpleLakeraEvaluator:
                 "error": str(e)
             }
     
-    def analyze_prediction(self, results: List[Dict]) -> str:
-        """Simple prediction analysis"""
+    def analyze_prediction(self, results: List[Dict], threat_cutoff: str = 'l3') -> str:
+        """Simple prediction analysis with configurable threat cutoff"""
         threat_detectors = []
+        
+        # Define threat levels hierarchy (higher number = more confident)
+        threat_levels = {
+            'l5_unlikely': 1,
+            'l4_less_likely': 2, 
+            'l3_likely': 3,
+            'l2_very_likely': 4,
+            'l1_confident': 5
+        }
+        
+        # Get cutoff threshold
+        cutoff_value = threat_levels.get(threat_cutoff, 3)  # Default to l3
         
         for detector in results:
             detector_type = detector.get('detector_type', 'unknown')
             detector_result = detector.get('result', 'l5_unlikely')
             
-            if detector_result in ['l1_confident', 'l2_very_likely', 'l3_likely']:
+            # Check if this detector result meets the threat cutoff
+            result_value = threat_levels.get(detector_result, 1)
+            
+            if result_value >= cutoff_value:
                 threat_detectors.append(f"{detector_type}({detector_result})")
         
         if threat_detectors:
@@ -266,7 +294,7 @@ class SimpleLakeraEvaluator:
                         gt_label = "THREAT" if gt_value else "SAFE"
                 
                 # Prediction
-                prediction = self.analyze_prediction(result.get('results', []))
+                prediction = self.analyze_prediction(result.get('results', []), self.threat_cutoff)
                 
                 csv_data.append({
                     'index': index,
@@ -302,7 +330,8 @@ class SimpleLakeraEvaluator:
 async def process_dataset_simple(file_path: str, api_key: str, 
                                text_column: Optional[str] = None,
                                label_column: Optional[str] = None,
-                               max_rows: int = None):
+                               max_rows: int = None,
+                               threat_cutoff: str = 'l3'):
     """Simple dataset processing with enhanced file format support"""
     
     logger.info(f"📁 Loading dataset: {file_path}")
@@ -634,7 +663,7 @@ async def process_dataset_simple(file_path: str, api_key: str,
         logger.info(f"🔢 Limited to first {max_rows} rows for testing")
     
     # Process with API
-    async with SimpleLakeraEvaluator(api_key) as evaluator:
+    async with SimpleLakeraEvaluator(api_key, threat_cutoff) as evaluator:
         
         # Test API first
         if not await evaluator.test_api():
@@ -664,22 +693,78 @@ def main():
     """Main function with verbose startup"""
     print("🎯 Parsing arguments...")
     
-    parser = argparse.ArgumentParser(description='Simple Lakera Guard Evaluator')
-    parser.add_argument('--datasets', nargs='+', required=True, help='Dataset files')
+    parser = argparse.ArgumentParser(
+        description='Enhanced Lakera Guard Evaluator with Configurable Threat Cutoff',
+        epilog="""
+Supported file formats:
+  - CSV (.csv)
+  - Parquet (.parquet) - requires: pip install pyarrow  
+  - JSON Lines (.jsonl)
+  - JSON (.json)
+
+Threat Cutoff Levels:
+  l1 = l1_confident (90-100% confidence) - Very strict, only highest confidence threats
+  l2 = l2_very_likely (70-90% confidence) - Strict, high confidence threats  
+  l3 = l3_likely (50-70% confidence) - Moderate, balanced approach (DEFAULT)
+  l4 = l4_less_likely (30-50% confidence) - Sensitive, catches more potential threats
+  l5 = l5_unlikely (0-30% confidence) - Very sensitive, catches almost everything
+
+Examples:
+  # Default (l3 cutoff - balanced)
+  python3 simple_lakera_evaluator.py --datasets data.csv --env YOUR_API_KEY
+  
+  # Strict mode (only high confidence threats)
+  python3 simple_lakera_evaluator.py --datasets data.csv --threat-cutoff l2 --env YOUR_API_KEY
+  
+  # Very strict (only highest confidence)
+  python3 simple_lakera_evaluator.py --datasets data.csv --threat-cutoff l1 --env YOUR_API_KEY
+  
+  # Sensitive mode (catch more potential threats)
+  python3 simple_lakera_evaluator.py --datasets data.csv --threat-cutoff l4 --env YOUR_API_KEY
+  
+  # Test with Parquet file
+  python3 simple_lakera_evaluator.py --datasets safety.parquet --threat-cutoff l2 --max-rows 10 --env YOUR_API_KEY
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('--datasets', nargs='+', required=True, help='Dataset files (.csv, .parquet, .jsonl, .json)')
     parser.add_argument('--env', required=True, help='API key')
-    parser.add_argument('--text-column', help='Text column name')
-    parser.add_argument('--label-column', help='Label column name')
-    parser.add_argument('--max-rows', type=int, help='Limit rows for testing')
+    parser.add_argument('--text-column', help='Text column name (auto-detected if not specified)')
+    parser.add_argument('--label-column', help='Label column name (auto-detected if not specified)')
+    parser.add_argument('--max-rows', type=int, help='Limit rows for testing (useful for large files)')
+    parser.add_argument('--threat-cutoff', choices=['l1', 'l2', 'l3', 'l4', 'l5'], default='l3',
+                       help='Threat detection cutoff level (default: l3). Lower = stricter, Higher = more sensitive')
     
     args = parser.parse_args()
     
     print(f"✅ Arguments parsed:")
     print(f"   Datasets: {args.datasets}")
-    print(f"   Text column: {args.text_column}")
-    print(f"   Label column: {args.label_column}")
+    print(f"   Text column: {args.text_column or 'auto-detect'}")
+    print(f"   Label column: {args.label_column or 'auto-detect'}")
+    print(f"   Threat cutoff: {args.threat_cutoff}")
     print(f"   API key length: {len(args.env)}")
     if args.max_rows:
         print(f"   Max rows: {args.max_rows}")
+    
+    # Explain cutoff choice
+    cutoff_explanations = {
+        'l1': 'Very strict - only 90-100% confident threats',
+        'l2': 'Strict - only 70-90% confident threats', 
+        'l3': 'Balanced - 50-70% confident threats (recommended)',
+        'l4': 'Sensitive - 30-50% confident threats',
+        'l5': 'Very sensitive - catches almost everything'
+    }
+    print(f"   Cutoff meaning: {cutoff_explanations[args.threat_cutoff]}")
+    
+    # Check if pyarrow is available for Parquet files
+    parquet_files = [f for f in args.datasets if f.endswith('.parquet')]
+    if parquet_files:
+        try:
+            import pyarrow
+            print(f"✅ PyArrow available for Parquet files")
+        except ImportError:
+            print(f"⚠️  Warning: PyArrow not available. Install with: pip install pyarrow")
+            print(f"   Parquet files may fail to load: {parquet_files}")
     
     # Process each dataset
     for dataset_path in args.datasets:
@@ -687,7 +772,7 @@ def main():
         
         try:
             success = asyncio.run(process_dataset_simple(
-                dataset_path, args.env, args.text_column, args.label_column, args.max_rows
+                dataset_path, args.env, args.text_column, args.label_column, args.max_rows, args.threat_cutoff
             ))
             
             if success:
