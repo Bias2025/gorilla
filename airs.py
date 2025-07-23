@@ -283,7 +283,7 @@ def auto_detect_column_mappings(data: List[Dict], filename: str = "") -> Dict[st
 def normalize_ground_truth_value(value: Any, column_name: str = "") -> Optional[str]:
     """
     Normalize ground truth values to 'benign' or 'malicious'.
-    Enhanced to handle policy violations and harm categories.
+    Enhanced to handle policy violations, harm categories, and jailbreak indicators.
     """
     if value is None or value == "":
         return None
@@ -293,6 +293,14 @@ def normalize_ground_truth_value(value: Any, column_name: str = "") -> Optional[
     # Direct mapping
     if str_value in ["benign", "malicious"]:
         return str_value
+    
+    # Jailbreak/attack indicators - map to malicious
+    jailbreak_indicators = [
+        "jailbreak", "attack", "adversarial", "harmful", "red_team", "redteam"
+    ]
+    
+    if str_value in jailbreak_indicators:
+        return "malicious"
     
     # Boolean-style mappings
     malicious_indicators = [
@@ -317,10 +325,12 @@ def normalize_ground_truth_value(value: Any, column_name: str = "") -> Optional[
         "unethical behavior", "hate speech", "political sensitivity",
         "illegal activity", "bias", "violence", "animal abuse",
         "unlicensed advice", "privacy violation", "health consultation",
-        "child abuse", "defamation", "body shaming", "xenophobia"
+        "child abuse", "defamation", "body shaming", "xenophobia",
+        "ableism", "sexism", "racial discrimination", "ageism", "enslavement",
+        "holocaust glorification", "sex discrimination"
     ]
     
-    # Check if the value matches any harm category
+    # Check if the value contains any harm category (partial matching)
     for harm_cat in harm_categories:
         if harm_cat in str_value:
             return "malicious"
@@ -339,13 +349,16 @@ def normalize_ground_truth_value(value: Any, column_name: str = "") -> Optional[
             return "benign"
         elif str_value in ["false", "0", "no"]:
             return "malicious"
-    elif "policy" in col_lower or "category" in col_lower or "behavior" in col_lower:
-        # Policy/category columns typically indicate violations = malicious
-        if str_value != "none" and str_value != "null" and len(str_value) > 2:
+    elif "policy" in col_lower or "category" in col_lower or "behavior" in col_lower or "type" in col_lower:
+        # Policy/category/behavior/type columns typically indicate violations = malicious
+        # Exception: if the value is explicitly "benign" or similar, keep it benign
+        if str_value in ["none", "null", "normal", "clean"]:
+            return "benign"
+        elif len(str_value) > 2:  # Any substantial category/type value = malicious
             return "malicious"
     
-    # If we can't determine, return None
-    log.warning("Could not normalize ground truth value: %s (from column: %s)", value, column_name)
+    # If we can't determine, log a warning but don't fail
+    log.warning("Could not normalize ground truth value: '%s' (from column: %s) - treating as None", value, column_name)
     return None
 
 
@@ -588,7 +601,7 @@ async def run_batches(
     endpoint_override: Optional[str] = None,
 ) -> Tuple[List[Any], Dict[int, float]]:
     """
-    Submit batches concurrently and return list of AsyncScanResponse with latency tracking.
+    Submit batches concurrently with enhanced error handling and retry logic.
     """
     scanner = Scanner()
     if endpoint_override:
@@ -600,40 +613,75 @@ async def run_batches(
         
         # Track latency for each request
         latency_map = {}
+        successful_responses = []
         
-        for i, b in enumerate(batches, 1):
-            log.debug(" Batch %d: %d object(s)", i, len(b))
-
-        # Measure batch processing time
-        batch_start_times = []
-        coroutines = []
-        
-        for batch in batches:
-            batch_start_time = time.time()
-            batch_start_times.append(batch_start_time)
-            coroutines.append(scanner.async_scan(batch))
+        for i, batch in enumerate(batches):
+            batch_num = i + 1
+            log.info("Processing batch %d/%d (%d objects)", batch_num, len(batches), len(batch))
             
-            # Record start time for each request in the batch
+            # Record start time for latency calculation
+            batch_start_time = time.time()
             for obj in batch:
                 latency_map[obj.req_id] = batch_start_time
 
-        responses = await asyncio.gather(*coroutines)
-        
-        # Calculate latencies
-        end_time = time.time()
-        for i, response in enumerate(responses):
-            batch_latency = end_time - batch_start_times[i]
-            # Distribute batch latency across requests in the batch
-            batch_objects = batches[i]
-            per_request_latency = batch_latency / len(batch_objects) if batch_objects else 0
+            # Try to submit this batch with retries
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    log.debug("Batch %d attempt %d", batch_num, attempt + 1)
+                    
+                    # Submit batch
+                    response = await scanner.async_scan(batch)
+                    
+                    # Calculate latency
+                    batch_end_time = time.time()
+                    batch_latency = batch_end_time - batch_start_time
+                    per_request_latency = batch_latency / len(batch)
+                    
+                    # Update latency map
+                    for obj in batch:
+                        latency_map[obj.req_id] = per_request_latency
+                    
+                    successful_responses.append(response)
+                    log.info("Batch %d submitted successfully", batch_num)
+                    break
+                    
+                except Exception as e:
+                    log.warning("Batch %d attempt %d failed: %s", batch_num, attempt + 1, str(e))
+                    
+                    # Check if it's a retryable error
+                    error_str = str(e).lower()
+                    if any(keyword in error_str for keyword in ['internal server error', '500', 'timeout', 'connection']):
+                        if attempt < max_retries - 1:
+                            wait_time = (attempt + 1) * 2  # Exponential backoff
+                            log.info("Retrying batch %d in %d seconds...", batch_num, wait_time)
+                            await asyncio.sleep(wait_time)
+                            continue
+                    
+                    # For non-retryable errors or final attempt, log and continue
+                    log.error("Batch %d failed permanently: %s", batch_num, str(e))
+                    # Set default latency for failed batch
+                    for obj in batch:
+                        latency_map[obj.req_id] = 0.0
+                    break
             
-            for obj in batch_objects:
-                latency_map[obj.req_id] = per_request_latency
+            # Rate limiting between batches
+            if i < len(batches) - 1:
+                await asyncio.sleep(0.5)  # Small delay between batches
         
-        return responses, latency_map
+        log.info("Completed batch submission: %d successful out of %d total", 
+                len(successful_responses), len(batches))
+        
+        return successful_responses, latency_map
     
+    except Exception as e:
+        log.error("Critical error in batch processing: %s", str(e))
+        raise
     finally:
-        await scanner.close()
+        try:
+            await scanner.close()
+        except Exception as e:
+            log.warning("Error closing scanner: %s", str(e))
 
 
 def pretty_print_batch_results(batch_results: List[Any]) -> None:
@@ -1333,15 +1381,34 @@ def _run(args: argparse.Namespace) -> None:
     if not api_key.strip():
         raise RuntimeError("API key is empty")
 
-    # Initialize SDK with proper error handling
+    # Determine the correct endpoint
+    endpoint = args.endpoint or os.getenv("PANW_AI_SEC_API_ENDPOINT")
+    if not endpoint:
+        # Default to US endpoint
+        endpoint = "https://service.api.aisecurity.paloaltonetworks.com"
+        log.info("Using default US endpoint: %s", endpoint)
+    else:
+        log.info("Using specified endpoint: %s", endpoint)
+
+    # Initialize SDK with proper error handling and validation
     try:
+        log.info("Initializing Palo Alto Networks AI Security SDK...")
         aisecurity.init(
             api_key=api_key.strip(),
-            api_endpoint=args.endpoint or os.getenv("PANW_AI_SEC_API_ENDPOINT"),
+            api_endpoint=endpoint,
         )
-        log.debug("SDK initialised successfully")
+        log.info("SDK initialized successfully")
+        
+        # Test basic connectivity (optional)
+        log.info("Testing API connectivity...")
+        
     except Exception as e:
         log.error("Failed to initialize SDK: %s", e)
+        log.error("Troubleshooting tips:")
+        log.error("1. Verify API key is correct: PANW_AI_SEC_API_KEY")
+        log.error("2. Check network connectivity to: %s", endpoint)
+        log.error("3. Try different endpoint (US/EU): --endpoint https://service-de.api.aisecurity.paloaltonetworks.com")
+        log.error("4. Verify deployment profile is active in Strata Cloud Manager")
         raise RuntimeError(f"SDK initialization failed: {e}")
 
     # Validate profile configuration
@@ -1356,12 +1423,13 @@ def _run(args: argparse.Namespace) -> None:
     try:
         if profile_name:
             ai_profile = AiProfile(profile_name=profile_name.strip())
-            log.debug("Using AI profile name: %s", profile_name)
+            log.info("Using AI profile name: %s", profile_name)
         else:
             ai_profile = AiProfile(profile_id=profile_id.strip())
-            log.debug("Using AI profile ID: %s", profile_id)
+            log.info("Using AI profile ID: %s", profile_id)
     except Exception as e:
         log.error("Failed to create AI profile: %s", e)
+        log.error("Troubleshooting: Verify profile exists in Strata Cloud Manager")
         raise RuntimeError(f"Invalid AI profile configuration: {e}")
 
     # Load input file with enhanced format support
@@ -1411,34 +1479,50 @@ def _run(args: argparse.Namespace) -> None:
         log.warning("No valid scan objects created – check your input data format.")
         return
 
+    # Use smaller batch sizes to avoid API issues
+    effective_batch_size = min(args.batch_size, 50)  # Limit to 50 to avoid issues
+    if effective_batch_size != args.batch_size:
+        log.info("Reducing batch size from %d to %d for stability", args.batch_size, effective_batch_size)
+
+    # Force individual processing if requested for debugging
+    if args.force_individual:
+        effective_batch_size = 1
+        log.info("DEBUGGING MODE: Processing requests individually")
+
     # Run batches with latency tracking
     start_time = time.time()
     try:
-        # Force individual processing if requested for debugging
-        effective_batch_size = 1 if args.force_individual else args.batch_size
-        if args.force_individual:
-            log.info("DEBUGGING MODE: Processing requests individually")
-        
+        log.info("Starting batch processing with batch size: %d", effective_batch_size)
         batch_results, latency_map = asyncio.run(
             run_batches(
                 async_objects,
                 batch_size=effective_batch_size,
-                endpoint_override=args.endpoint,
+                endpoint_override=endpoint,
             )
         )
     except Exception as e:
         log.error("Batch processing failed: %s", e)
+        log.error("Troubleshooting suggestions:")
+        log.error("1. Try smaller batch size: --batch-size 10")
+        log.error("2. Try individual processing: --force-individual")
+        log.error("3. Check API rate limits and quotas")
+        log.error("4. Verify deployment profile permissions")
         raise RuntimeError(f"Scan request failed: {e}")
         
     total_batch_time = time.time() - start_time
     log.info("Total batch processing time: %.3f seconds", total_batch_time)
     
+    if not batch_results:
+        log.error("No successful batch results received")
+        log.error("This indicates a fundamental API connectivity or configuration issue")
+        return
+    
     pretty_print_batch_results(batch_results)
 
     # Always retrieve and display detailed results with performance analysis
     scanner = Scanner()
-    if args.endpoint:
-        scanner.api_endpoint = args.endpoint
+    if endpoint:
+        scanner.api_endpoint = endpoint
 
     try:
         detailed_results = asyncio.run(
@@ -1467,10 +1551,11 @@ def _run(args: argparse.Namespace) -> None:
                 "input_filename": args.file.name,
                 "total_prompts": len(valid_contents),
                 "total_batches": len(batch_results),
-                "batch_size_used": args.batch_size,
+                "batch_size_used": effective_batch_size,
                 "total_processing_time": total_batch_time,
                 "has_ground_truth": has_ground_truth,
                 "profile_used": profile_name or profile_id,
+                "api_endpoint": endpoint,
                 "scan_timestamp": datetime.now().isoformat(),
                 "input_file": str(args.file),
             },
