@@ -303,7 +303,7 @@ def generate_output_filename(input_file: str) -> str:
     return f"{input_name}_{timestamp}.csv"
 
 
-def write_result_to_csv(output_file: str, result: Dict, write_header: bool = False) -> None:
+def write_result_to_csv(output_file: str, result: Dict, write_header: bool = False, prompt_column: str = 'prompt') -> None:
     """Write a single result to the CSV output file."""
     mode = 'w' if write_header else 'a'
     
@@ -312,7 +312,7 @@ def write_result_to_csv(output_file: str, result: Dict, write_header: bool = Fal
         
         if write_header:
             writer.writerow([
-                'prompt', 'action', 'category', 'scan_id', 
+                prompt_column, 'action', 'category', 'scan_id', 
                 'report_id', 'profile_name', 'latency', 'status_code'
             ])
         
@@ -342,7 +342,7 @@ def process_prompts(input_file: str, profile_id: str, prompt_column: str) -> str
         logger.info("Output will be saved to: %s", output_file)
         
         # Write CSV header
-        write_result_to_csv(output_file, {}, write_header=True)
+        write_result_to_csv(output_file, {}, write_header=True, prompt_column=prompt_column)
         
         # Process prompts with progress tracking
         successful_requests = 0
@@ -362,7 +362,7 @@ def process_prompts(input_file: str, profile_id: str, prompt_column: str) -> str
                 result = scanner.process_prompt(prompt, index)
                 
                 # Write result
-                write_result_to_csv(output_file, result)
+                write_result_to_csv(output_file, result, prompt_column=prompt_column)
                 
                 # Update counters
                 if result['status_code'] == 200:
@@ -384,7 +384,7 @@ def process_prompts(input_file: str, profile_id: str, prompt_column: str) -> str
                     'scan_id': '', 'report_id': '', 'profile_name': '',
                     'latency': 0, 'status_code': 'ERROR'
                 }
-                write_result_to_csv(output_file, error_result)
+                write_result_to_csv(output_file, error_result, prompt_column=prompt_column)
         
         # Calculate metrics
         end_time = time.time()
