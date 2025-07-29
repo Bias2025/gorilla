@@ -316,11 +316,13 @@ def write_result_to_csv(output_file: str, result: Dict, write_header: bool = Fal
                 'report_id', 'profile_name', 'latency', 'status_code'
             ])
         
-        writer.writerow([
-            result['prompt'], result['action'], result['category'],
-            result['scan_id'], result['report_id'], result['profile_name'],
-            result['latency'], result['status_code']
-        ])
+        # Only write data row if result contains data
+        if result and 'prompt' in result:
+            writer.writerow([
+                result['prompt'], result['action'], result['category'],
+                result['scan_id'], result['report_id'], result['profile_name'],
+                result['latency'], result['status_code']
+            ])
 
 
 def process_prompts(input_file: str, profile_id: str, prompt_column: str) -> str:
