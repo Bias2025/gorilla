@@ -602,4 +602,140 @@ async def process_dataset_simple(file_path: str, api_key: str,
                         logger.info(f"✅ Auto-detected label column: {detected_label_col} (partial match)")
                         break
                 if detected_label_col:
-                    bre
+                    break
+
+        # Analyze columns by content if still not found
+        if not detected_label_col:
+            for col in df.columns:
+                if col != detected_text_col and df[col].dtype == 'object':
+                    unique_values = df[col].dropna().unique()
+                    if 2 <= len(unique_values) <= 10:  # Reasonable number of categories
+                        logger.info(f"🎯 Potential label column: '{col}' with values: {list(unique_values)}")
+
+                        # Check if values look like labels
+                        label_like_score = 0
+                        for value in unique_values:
+                            value_str = str(value).lower()
+                            if any(term in value_str for term in ['safe', 'unsafe', 'jailbreak', 'benign', 'harmful', 'true', 'false', '0', '1']):
+                                label_like_score += 1
+
+                        if label_like_score > 0:
+                            detected_label_col = col
+                            logger.info(f"✅ Auto-detected label column: {detected_label_col} (by content)")
+                            break
+
+    # Analyze ground truth
+    ground_truth = []
+    if detected_label_col:
+        logger.info(f"🎯 Analyzing ground truth column: {detected_label_col}")
+        unique_values = df[detected_label_col].unique()
+        logger.info(f"   Unique values: {list(unique_values)}")
+
+        for label in df[detected_label_col]:
+            parsed = SimpleGroundTruthParser.parse_label(label)
+            ground_truth.append(parsed)
+
+        threat_count = sum(1 for gt in ground_truth if gt is True)
+        safe_count = sum(1 for gt in ground_truth if gt is False)
+        unknown_count = sum(1 for gt in ground_truth if gt is None)
+
+        logger.info(f"   Parsed as THREAT: {threat_count}")
+        logger.info(f"   Parsed as SAFE: {safe_count}")
+        logger.info(f"   Unknown: {unknown_count}")
+    else:
+        logger.warning("⚠️ No ground truth column found")
+        ground_truth = [None] * len(df)
+
+    # Extract texts
+    texts = df[detected_text_col].astype(str).tolist()
+
+    # Limit rows for testing
+    if max_rows and max_rows < len(texts):
+        texts = texts[:max_rows]
+        ground_truth = ground_truth[:max_rows]
+        logger.info(f"🔢 Limited to first {max_rows} rows for testing")
+
+    # Process with API
+    async with SimpleLakeraEvaluator(api_key, project_id=project_id) as evaluator:
+
+        # Test API first
+        if not await evaluator.test_api():
+            logger.error("❌ API test failed - stopping")
+            return False
+
+        logger.info(f"🚀 Processing {len(texts)} prompts...")
+
+        all_results = []
+
+        # Process with progress bar
+        with tqdm(total=len(texts), desc="Processing") as pbar:
+            for i, text in enumerate(texts):
+                result = await evaluator.check_single_prompt(text, i)
+                all_results.append(result)
+                pbar.update(1)
+
+                # Small delay to be nice to API
+                await asyncio.sleep(0.1)
+
+        # Save results
+        _ = evaluator.save_results(all_results, ground_truth, file_path)
+
+        return True
+
+
+def main():
+    """Main function with verbose startup"""
+    print("🎯 Parsing arguments...")
+
+    parser = argparse.ArgumentParser(description='Simple Lakera Guard Evaluator')
+    parser.add_argument('--datasets', nargs='+', required=True, help='Dataset files')
+    parser.add_argument('--env', required=True, help='API key')
+    parser.add_argument('--project-id', help='Lakera Guard project ID (selects policy/profile). '
+                                            'If omitted, uses LAKERA_PROJECT_ID env var or defaults.')
+    parser.add_argument('--text-column', help='Text column name')
+    parser.add_argument('--label-column', help='Label column name')
+    parser.add_argument('--max-rows', type=int, help='Limit rows for testing')
+
+    args = parser.parse_args()
+
+    project_id = args.project_id or os.getenv('LAKERA_PROJECT_ID')
+
+    print(f"✅ Arguments parsed:")
+    print(f"   Datasets: {args.datasets}")
+    print(f"   Text column: {args.text_column}")
+    print(f"   Label column: {args.label_column}")
+    print(f"   API key length: {len(args.env)}")
+    print(f"   Project ID: {project_id if project_id else '<default>'}")
+    if args.max_rows:
+        print(f"   Max rows: {args.max_rows}")
+
+    # Process each dataset
+    for dataset_path in args.datasets:
+        print(f"\n🎯 Processing: {dataset_path}")
+
+        try:
+            success = asyncio.run(process_dataset_simple(
+                dataset_path,
+                api_key=args.env,
+                project_id=project_id,
+                text_column=args.text_column,
+                label_column=args.label_column,
+                max_rows=args.max_rows
+            ))
+
+            if success:
+                print(f"✅ Successfully processed {dataset_path}")
+            else:
+                print(f"❌ Failed to process {dataset_path}")
+
+        except KeyboardInterrupt:
+            print("\n⚠️ Interrupted by user")
+            break
+        except Exception as e:
+            print(f"❌ Error processing {dataset_path}: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+if __name__ == '__main__':
+    main()
