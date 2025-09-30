@@ -2,11 +2,11 @@
 """
 Lakera Guard Evaluator (Large Dataset Optimized, Single-File Output + Summary)
 
-- Streams CSV/JSONL/Parquet in chunks
+- Streams CSV/JSONL/Parquet/JSON in chunks
 - Concurrency-limited async requests with keep-alive
 - Retries with exponential backoff + jitter
 - Append-only output with --resume (per-dataset resume inside a single CSV)
-- Quiet by default; optional progress bar
+- Quiet by default; optional progress bar (--progress)
 - Single merged CSV via --output; adds a `dataset` column
 - Confusion matrix + metrics via --summary-out
 """
@@ -97,7 +97,6 @@ def read_last_index_for_dataset(out_path: Path, dataset_name: str) -> int:
     if not out_path.exists():
         return 0
     try:
-        # read minimal columns in chunks to avoid RAM spikes
         last = -1
         for df in pd.read_csv(out_path, chunksize=200000, usecols=["dataset", "index"]):
             m = df["dataset"] == dataset_name
@@ -163,8 +162,6 @@ def detect_columns(df: pd.DataFrame, text_col: Optional[str], label_col: Optiona
         lcands = ['type', 'label', 'labels', 'ground_truth', 'groundtruth', 'gt', 'class', 'category',
                   'classification', 'target', 'y', 'output', 'is_safe', 'safety', 'risk', 'harmful',
                   'toxicity', 'jailbreak', 'adversarial', 'behavior', 'behaviour', 'intent', 'malicious', 'benign']
-        lowcols = {c.lower}: c for c in df.columns  # <-- leave corrected below
-        # ^^^ OOPS—typo caught! Fixing lowcols construction:
         lowcols = {c.lower(): c for c in df.columns}
         for c in lcands:
             if c in lowcols:
@@ -260,13 +257,15 @@ class LakeraClient:
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=self.timeout_s)
         conn = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, enable_cleanup_closed=True)
+        # trust_env=True to honor HTTPS_PROXY/HTTP_PROXY/NO_PROXY if present
         self.session = aiohttp.ClientSession(
             timeout=timeout,
             connector=conn,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-            }
+            },
+            trust_env=True,
         )
         return self
 
@@ -376,120 +375,3 @@ async def process_file(path: str, api_key: str, project_id: Optional[str],
                         "ground_truth": "THREAT" if gt is True else "SAFE" if gt is False else "N/A",
                         "prediction": pred,
                         "latency_ms": f"{res['latency']*1000:.2f}",
-                        "detector_count": len(res["results"])
-                    })
-                else:
-                    # Skip failed rows to avoid corrupting resume logic; they will retry on next run.
-                    continue
-
-            header_written = write_rows(out_path, out_rows, header_written)
-            total_written += len(out_rows)
-            if pbar:
-                pbar.update(len(rows_to_process))
-
-            if max_rows is not None and total_written >= max_rows:
-                break
-
-    if pbar:
-        pbar.close()
-
-    print(f"[done] {Path(path).name} -> {out_path} | dataset={dataset_name} | written rows: {total_written}")
-
-
-def write_confusion_summary(out_path: Path, summary_out: Optional[Path]) -> None:
-    """Compute confusion matrix & metrics from a (possibly huge) CSV."""
-    tp = tn = fp = fn = 0
-    for df in pd.read_csv(out_path, chunksize=200000, usecols=["ground_truth", "prediction"]):
-        df = df[df["ground_truth"].isin(["SAFE", "THREAT"])].copy()
-        y_true = df["ground_truth"].eq("THREAT")
-        y_pred = df["prediction"].astype(str).str.startswith("THREAT")
-        tp += (y_true & y_pred).sum()
-        tn += (~y_true & ~y_pred).sum()
-        fp += (~y_true & y_pred).sum()
-        fn += (y_true & ~y_pred).sum()
-    total = tp + tn + fp + fn
-    acc = (tp + tn) / (total or 1)
-    prec = tp / (tp + fp or 1)
-    rec = tp / (tp + fn or 1)
-    f1 = 2 * prec * rec / (prec + rec or 1)
-    print(f"[summary] TP={tp} FP={fp} FN={fn} TN={tn} | acc={acc:.4f} prec={prec:.4f} rec={rec:.4f} f1={f1:.4f}")
-    if summary_out:
-        import csv
-        summary_out.parent.mkdir(parents=True, exist_ok=True)
-        with summary_out.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["tp", "fp", "fn", "tn", "accuracy", "precision", "recall", "f1"])
-            w.writeheader()
-            w.writerow({
-                "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-                "accuracy": f"{acc:.6f}", "precision": f"{prec:.6f}",
-                "recall": f"{rec:.6f}", "f1": f"{f1:.6f}"
-            })
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Lakera Guard Evaluator (large-dataset optimized, single-file output)")
-    ap.add_argument("--datasets", nargs="+", required=True, help="Input files (.csv, .jsonl, .json, .parquet)")
-    ap.add_argument("--env", help="Lakera API key (fallback to LAKERA_API_KEY)")
-    ap.add_argument("--project-id", help="Lakera project ID (fallback to LAKERA_PROJECT_ID)")
-    ap.add_argument("--text-column", help="Text column name (optional)")
-    ap.add_argument("--label-column", help="Label column name (optional)")
-    ap.add_argument("--max-rows", type=int, help="Process at most N rows (after resume offset)")
-
-    ap.add_argument("--chunksize", type=int, default=1000, help="Streaming chunk size (default: 1000)")
-    ap.add_argument("--concurrency", type=int, default=8, help="Concurrent HTTP requests (default: 8)")
-    ap.add_argument("--timeout", type=float, default=30.0, help="Per-request timeout seconds (default: 30)")
-    ap.add_argument("--retries", type=int, default=6, help="Max retries per request (default: 6)")
-    ap.add_argument("--backoff-base", type=float, default=0.5, help="Base backoff seconds (default: 0.5)")
-    ap.add_argument("--backoff-max", type=float, default=10.0, help="Max backoff seconds (default: 10.0)")
-
-    ap.add_argument("--output", help="Explicit output CSV path (optional)")
-    ap.add_argument("--output-dir", default="lakera_results", help="Output directory (default: lakera_results)")
-    ap.add_argument("--resume", action="store_true", help="Append to output and skip already written rows")
-    ap.add_argument("--progress", action="store_true", help="Show progress bar (quiet by default)")
-    ap.add_argument("--dataset-name", help="Name to tag rows from this dataset (defaults to input filename)")
-    ap.add_argument("--summary-out", help="Write confusion matrix/metrics CSV to this path at the end")
-
-    args = ap.parse_args()
-
-    api_key = args.env or os.getenv("LAKERA_API_KEY")
-    if not api_key:
-        print("Provide API key via --env or LAKERA_API_KEY", file=sys.stderr)
-        sys.exit(2)
-    project_id = args.project_id or os.getenv("LAKERA_PROJECT_ID")
-
-    for path in args.datasets:
-        if not Path(path).exists():
-            print(f"[skip] file not found: {path}", file=sys.stderr)
-            continue
-        out_path = ensure_out_path(path, args.output_dir, args.output)
-        dataset_name = args.dataset_name or Path(path).stem
-        try:
-            asyncio.run(process_file(
-                path=path,
-                api_key=api_key,
-                project_id=project_id,
-                text_col=args.text_column,
-                label_col=args.label_column,
-                max_rows=args.max_rows,
-                chunksize=args.chunksize,
-                concurrency=args.concurrency,
-                timeout=args.timeout,
-                retries=args.retries,
-                backoff_base=args.backoff_base,
-                backoff_max=args.backoff_max,
-                out_path=out_path,
-                resume=args.resume,
-                show_progress=args.progress,
-                dataset_name=dataset_name
-            ))
-        except KeyboardInterrupt:
-            print("\n[interrupt] stopping")
-            sys.exit(130)
-
-    # single summary pass (useful when --output points to one file across many datasets)
-    if args.output:
-        write_confusion_summary(Path(args.output), Path(args.summary_out) if args.summary_out else None)
-
-
-if __name__ == "__main__":
-    main()
