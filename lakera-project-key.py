@@ -5,7 +5,7 @@ Lakera Guard Evaluator (Large Dataset Optimized, Single-File Output + Summary)
 - Streams CSV/JSONL/Parquet/JSON in chunks
 - Concurrency-limited async requests with keep-alive
 - Retries with exponential backoff + jitter
-- Append-only output with --resume (per-dataset resume inside a single CSV)
+- Append-only output with --resume (per-dataset resume in a single CSV)
 - Quiet by default; optional progress bar (--progress)
 - Single merged CSV via --output; adds a `dataset` column
 - Confusion matrix + metrics via --summary-out
@@ -54,15 +54,15 @@ def parse_boolish_label(label) -> Optional[bool]:
         return bool(label)
     s = str(label).strip().lower()
     threat = [
-        'jailbreak', 'adversarial', 'attack', 'prompt_injection', 'injection',
-        'harmful', 'dangerous', 'toxic', 'malicious', 'threatening', 'violent',
-        'inappropriate', 'unsafe', 'illegal', 'criminal', 'unethical',
-        'true', 'yes', '1', 'positive', 'threat'
+        "jailbreak", "adversarial", "attack", "prompt_injection", "injection",
+        "harmful", "dangerous", "toxic", "malicious", "threatening", "violent",
+        "inappropriate", "unsafe", "illegal", "criminal", "unethical",
+        "true", "yes", "1", "positive", "threat"
     ]
     safe = [
-        'benign', 'safe', 'harmless', 'acceptable', 'appropriate', 'ethical',
-        'legal', 'legitimate', 'allowed', 'clean', 'wholesome', 'normal',
-        'false', 'no', '0', 'negative'
+        "benign", "safe", "harmless", "acceptable", "appropriate", "ethical",
+        "legal", "legitimate", "allowed", "clean", "wholesome", "normal",
+        "false", "no", "0", "negative"
     ]
     if any(t in s for t in threat):
         return True
@@ -75,8 +75,8 @@ def analyze_prediction(results: List[Dict]) -> str:
     """Reduce Lakera detector results -> 'THREAT [...]' or 'SAFE'."""
     hits = []
     for d in results:
-        level = d.get('result', 'l5_unlikely')
-        if level in ('l1_confident', 'l2_very_likely', 'l3_likely'):
+        level = d.get("result", "l5_unlikely")
+        if level in ("l1_confident", "l2_very_likely", "l3_likely"):
             hits.append(f"{d.get('detector_type','?')}({level})")
     return f"THREAT [{', '.join(hits)}]" if hits else "SAFE"
 
@@ -131,8 +131,10 @@ def detect_columns(df: pd.DataFrame, text_col: Optional[str], label_col: Optiona
     if text_col and text_col in df.columns:
         tc = text_col
     else:
-        candidates = ['prompt', 'text', 'content', 'message', 'input', 'query', 'goal', 'instruction',
-                      'conversations', 'chat', 'dialogue', 'messages', 'question', 'user_input', 'request', 'task']
+        candidates = [
+            "prompt", "text", "content", "message", "input", "query", "goal", "instruction",
+            "conversations", "chat", "dialogue", "messages", "question", "user_input", "request", "task"
+        ]
         tc = None
         lowcols = {c.lower(): c for c in df.columns}
         for c in candidates:
@@ -159,9 +161,11 @@ def detect_columns(df: pd.DataFrame, text_col: Optional[str], label_col: Optiona
     if label_col and label_col in df.columns:
         lc = label_col
     else:
-        lcands = ['type', 'label', 'labels', 'ground_truth', 'groundtruth', 'gt', 'class', 'category',
-                  'classification', 'target', 'y', 'output', 'is_safe', 'safety', 'risk', 'harmful',
-                  'toxicity', 'jailbreak', 'adversarial', 'behavior', 'behaviour', 'intent', 'malicious', 'benign']
+        lcands = [
+            "type", "label", "labels", "ground_truth", "groundtruth", "gt", "class", "category",
+            "classification", "target", "y", "output", "is_safe", "safety", "risk", "harmful",
+            "toxicity", "jailbreak", "adversarial", "behavior", "behaviour", "intent", "malicious", "benign"
+        ]
         lowcols = {c.lower(): c for c in df.columns}
         for c in lcands:
             if c in lowcols:
@@ -173,7 +177,7 @@ def detect_columns(df: pd.DataFrame, text_col: Optional[str], label_col: Optiona
                 if c == tc or df[c].dtype != "object":
                     continue
                 vals = [str(v).lower() for v in df[c].dropna().head(50).tolist()]
-                if any(any(t in v for t in ('safe', 'unsafe', 'jailbreak', 'benign', 'harmful', 'true', 'false', '0', '1')) for v in vals):
+                if any(any(t in v for t in ("safe", "unsafe", "jailbreak", "benign", "harmful", "true", "false", "0", "1")) for v in vals):
                     lc = c
                     break
     return tc, lc
@@ -350,28 +354,4 @@ async def process_file(path: str, api_key: str, project_id: Optional[str],
             for i_rel, i_abs in enumerate(indices):
                 if i_abs < start_index:
                     continue
-                if max_rows is not None and (i_abs - start_index) >= max_rows:
-                    break
-                gt = None
-                if detected_label and detected_label in df.columns:
-                    gt = parse_boolish_label(df.iloc[i_rel][detected_label])
-                rows_to_process.append((i_abs, str(df.iloc[i_rel][detected_text]), gt))
-            if not rows_to_process:
-                if max_rows is not None and (global_index - start_index) >= max_rows:
-                    break
-                continue
-
-            tasks = [asyncio.create_task(client.check(prompt)) for (_, prompt, _) in rows_to_process]
-            results = await asyncio.gather(*tasks)
-
-            out_rows = []
-            for (i_abs, prompt, gt), res in zip(rows_to_process, results):
-                if res.get("ok"):
-                    pred = analyze_prediction(res["results"])
-                    out_rows.append({
-                        "dataset": dataset_name,
-                        "index": i_abs,
-                        "prompt": prompt,
-                        "ground_truth": "THREAT" if gt is True else "SAFE" if gt is False else "N/A",
-                        "prediction": pred,
-                        "latency_ms": f"{res['latency']*1000:.2f}",
+                if max_rows i_
