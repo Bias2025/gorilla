@@ -722,96 +722,117 @@ Examples:
     )
     
     # Required arguments
-    parser.add_argument(
-        "--datasets", 
-        nargs="+", 
-        required=True, 
-        help="Input files (.csv, .jsonl, .json, .parquet)"
-    )
+    parser.add_argument("--datasets", nargs="+", required=True, 
+                       help="Input files (.csv, .jsonl, .json, .parquet)")
     
     # API configuration
-    parser.add_argument(
-        "--env", 
-        help="Lakera API key (fallback to LAKERA_API_KEY env var)"
-    )
-    parser.add_argument(
-        "--project-id", 
-        help="Lakera project ID (fallback to LAKERA_PROJECT_ID env var)"
-    )
+    parser.add_argument("--env", help="Lakera API key (fallback to LAKERA_API_KEY env var)")
+    parser.add_argument("--project-id", help="Lakera project ID (fallback to LAKERA_PROJECT_ID env var)")
     
     # Column configuration
-    parser.add_argument(
-        "--text-column", 
-        help="Text column name (auto-detected if not specified)"
-    )
-    parser.add_argument(
-        "--label-column", 
-        help="Label column name (auto-detected if not specified)"
-    )
+    parser.add_argument("--text-column", help="Text column name (auto-detected if not specified)")
+    parser.add_argument("--label-column", help="Label column name (auto-detected if not specified)")
     
     # Processing configuration
-    parser.add_argument(
-        "--max-rows", 
-        type=int, 
-        help="Process at most N rows per dataset"
-    )
-    parser.add_argument(
-        "--chunksize", 
-        type=int, 
-        default=Config.DEFAULT_CHUNK_SIZE,
-        help=f"Streaming chunk size (default: {Config.DEFAULT_CHUNK_SIZE})"
-    )
-    parser.add_argument(
-        "--concurrency", 
-        type=int, 
-        default=Config.DEFAULT_CONCURRENCY,
-        help=f"Concurrent HTTP requests (default: {Config.DEFAULT_CONCURRENCY})"
-    )
+    parser.add_argument("--max-rows", type=int, help="Process at most N rows per dataset")
+    parser.add_argument("--chunksize", type=int, default=Config.DEFAULT_CHUNK_SIZE,
+                       help=f"Streaming chunk size (default: {Config.DEFAULT_CHUNK_SIZE})")
+    parser.add_argument("--concurrency", type=int, default=Config.DEFAULT_CONCURRENCY,
+                       help=f"Concurrent HTTP requests (default: {Config.DEFAULT_CONCURRENCY})")
     
     # Network configuration
-    parser.add_argument(
-        "--timeout", 
-        type=float, 
-        default=Config.DEFAULT_TIMEOUT,
-        help=f"Per-request timeout seconds (default: {Config.DEFAULT_TIMEOUT})"
-    )
-    parser.add_argument(
-        "--retries", 
-        type=int, 
-        default=Config.DEFAULT_RETRIES,
-        help=f"Max retries per request (default: {Config.DEFAULT_RETRIES})"
-    )
-    parser.add_argument(
-        "--backoff-base", 
-        type=float, 
-        default=Config.DEFAULT_BACKOFF_BASE,
-        help=f"Base backoff seconds (default: {Config.DEFAULT_BACKOFF_BASE})"
-    )
-    parser.add_argument(
-        "--backoff-max", 
-        type=float, 
-        default=Config.DEFAULT_BACKOFF_MAX,
-        help=f"Max backoff seconds (default: {Config.DEFAULT_BACKOFF_MAX})"
-    )
+    parser.add_argument("--timeout", type=float, default=Config.DEFAULT_TIMEOUT,
+                       help=f"Per-request timeout seconds (default: {Config.DEFAULT_TIMEOUT})")
+    parser.add_argument("--retries", type=int, default=Config.DEFAULT_RETRIES,
+                       help=f"Max retries per request (default: {Config.DEFAULT_RETRIES})")
+    parser.add_argument("--backoff-base", type=float, default=Config.DEFAULT_BACKOFF_BASE,
+                       help=f"Base backoff seconds (default: {Config.DEFAULT_BACKOFF_BASE})")
+    parser.add_argument("--backoff-max", type=float, default=Config.DEFAULT_BACKOFF_MAX,
+                       help=f"Max backoff seconds (default: {Config.DEFAULT_BACKOFF_MAX})")
     
     # Output configuration
-    parser.add_argument(
-        "--output", 
-        help="Explicit output CSV path (merges all datasets)"
-    )
-    parser.add_argument(
-        "--output-dir", 
-        default=Config.DEFAULT_OUTPUT_DIR,
-        help=f"Output directory (default: {Config.DEFAULT_OUTPUT_DIR})"
-    )
-    parser.add_argument(
-        "--resume", 
-        action="store_true",
-        help="Resume from last processed row (append mode)"
-    )
-    parser.add_argument(
-        "--progress", 
-        action="store_true",
-        help="Show progress bar (requires tqdm)"
-    )
-    parser.
+    parser.add_argument("--output", help="Explicit output CSV path (merges all datasets)")
+    parser.add_argument("--output-dir", default=Config.DEFAULT_OUTPUT_DIR,
+                       help=f"Output directory (default: {Config.DEFAULT_OUTPUT_DIR})")
+    parser.add_argument("--resume", action="store_true",
+                       help="Resume from last processed row (append mode)")
+    parser.add_argument("--progress", action="store_true",
+                       help="Show progress bar (requires tqdm)")
+    parser.add_argument("--dataset-name", help="Override dataset name (defaults to input filename)")
+    parser.add_argument("--summary-out", help="Write confusion matrix/metrics CSV to this path")
+    
+    # Logging configuration
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                       default="INFO", help="Set logging level (default: INFO)")
+    
+    args = parser.parse_args()
+    
+    # Configure logging
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+    
+    # Get API key
+    api_key = args.env or os.getenv("LAKERA_API_KEY")
+    if not api_key:
+        print("Error: API key required. Provide via --env or LAKERA_API_KEY environment variable", file=sys.stderr)
+        sys.exit(2)
+    
+    project_id = args.project_id or os.getenv("LAKERA_PROJECT_ID")
+    
+    # Validate input files
+    valid_files = []
+    for path in args.datasets:
+        if not Path(path).exists():
+            logger.error(f"File not found: {path}")
+        else:
+            valid_files.append(path)
+    
+    if not valid_files:
+        print("Error: No valid input files found", file=sys.stderr)
+        sys.exit(1)
+    
+    # Process each dataset
+    try:
+        for path in valid_files:
+            out_path = ensure_out_path(path, args.output_dir, args.output)
+            dataset_name = args.dataset_name or Path(path).stem
+            
+            logger.info(f"Starting processing of {path}")
+            
+            asyncio.run(process_file(
+                path=path,
+                api_key=api_key,
+                project_id=project_id,
+                text_col=args.text_column,
+                label_col=args.label_column,
+                max_rows=args.max_rows,
+                chunksize=args.chunksize,
+                concurrency=args.concurrency,
+                timeout=args.timeout,
+                retries=args.retries,
+                backoff_base=args.backoff_base,
+                backoff_max=args.backoff_max,
+                out_path=out_path,
+                resume=args.resume,
+                show_progress=args.progress,
+                dataset_name=dataset_name
+            ))
+            
+    except KeyboardInterrupt:
+        print("\n[Interrupt] Stopping gracefully...")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        sys.exit(1)
+    
+    # Generate summary if requested
+    if args.output and Path(args.output).exists():
+        write_confusion_summary(
+            Path(args.output), 
+            Path(args.summary_out) if args.summary_out else None
+        )
+    
+    logger.info("All processing complete")
+
+
+if __name__ == "__main__":
+    main()
