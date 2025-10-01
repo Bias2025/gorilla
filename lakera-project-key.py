@@ -527,6 +527,7 @@ async def process_file(
     # Setup progress bar if requested
     pbar = None
     if show_progress and TQDM_AVAILABLE:
+        from tqdm import tqdm
         pbar = tqdm(unit="rows", desc=f"Processing {Path(path).name}", leave=False)
     
     try:
@@ -805,4 +806,12 @@ Examples:
     )
     parser.add_argument(
         "--resume", 
-        action="
+        action="store_true",
+        help="Resume from last processed row (append mode)"
+    )
+    parser.add_argument(
+        "--progress", 
+        action="store_true",
+        help="Show progress bar (requires tqdm)"
+    )
+    parser.
