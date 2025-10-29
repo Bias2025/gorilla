@@ -69,13 +69,16 @@ aiohttp, pd = check_dependencies()
 class Config:
     """Configuration constants and defaults."""
     DEFAULT_CHUNK_SIZE = 1000
-    DEFAULT_CONCURRENCY = 8
+    DEFAULT_CONCURRENCY = 50  # Optimized for 100k+ prompt processing
     DEFAULT_TIMEOUT = 30.0
     DEFAULT_RETRIES = 6
     DEFAULT_BACKOFF_BASE = 0.5
     DEFAULT_BACKOFF_MAX = 10.0
     DEFAULT_OUTPUT_DIR = "lakera_results"
     API_URL = "https://api.lakera.ai/v2/guard/results"
+
+    # Rate limiting (requests per second)
+    DEFAULT_RATE_LIMIT = None  # None = no limit, set to avoid API quota exhaustion
     
     # Threat and safe keywords for label parsing
     THREAT_KEYWORDS = [
@@ -150,34 +153,73 @@ def analyze_prediction(results: List[Dict]) -> str:
 
 
 def ensure_out_path(input_path: str, output_dir: str = Config.DEFAULT_OUTPUT_DIR,
-                    explicit_output: Optional[str] = None) -> Path:
+                    explicit_output: Optional[str] = None,
+                    output_prefix: str = "lakera") -> Path:
     """Ensure output path exists and return it."""
     if explicit_output:
         out_path = Path(explicit_output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         return out_path
-    
+
     outdir = Path(output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
-    
+
     stem = Path(input_path).stem
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return outdir / f"lakera_{stem}_{ts}.csv"
+    return outdir / f"{output_prefix}_{stem}_{ts}.csv"
 
 
 def read_last_index_for_dataset(out_path: Path, dataset_name: str) -> int:
-    """Return next index for this dataset when resuming a merged CSV."""
+    """Return next index for this dataset when resuming a merged CSV.
+
+    Optimized to read from end of file for large datasets (100k+ rows).
+    """
     if not out_path.exists():
         return 0
-    
+
     try:
+        import csv
+
+        # Read last N lines efficiently (tail-like approach)
+        lines_to_check = 10000  # Check last 10k lines for this dataset
+
+        with out_path.open("rb") as f:
+            # Get file size
+            f.seek(0, os.SEEK_END)
+            file_size = f.tell()
+
+            if file_size == 0:
+                return 0
+
+            # Read from end in chunks
+            buffer_size = min(1024 * 1024, file_size)  # 1MB buffer
+            f.seek(max(0, file_size - buffer_size))
+
+            # Read and decode
+            tail_data = f.read().decode('utf-8', errors='ignore')
+
+        # Split into lines and process from end
+        lines = tail_data.split('\n')
+
+        # Find header to get column indices
+        header_line = None
+        with out_path.open("r", encoding="utf-8") as f:
+            header_line = f.readline().strip()
+
+        if not header_line:
+            return 0
+
+        reader = csv.DictReader([header_line] + lines[-lines_to_check:])
+
         last = -1
-        for df in pd.read_csv(out_path, chunksize=200000, usecols=["dataset", "index"]):
-            mask = df["dataset"] == dataset_name
-            if mask.any():
-                dataset_indices = df.loc[mask, "index"]
-                if not dataset_indices.empty:
-                    last = max(last, int(dataset_indices.max()))
+        for row in reader:
+            try:
+                if row.get("dataset") == dataset_name:
+                    idx = int(row.get("index", -1))
+                    last = max(last, idx)
+            except (ValueError, TypeError):
+                continue
+
         return last + 1 if last >= 0 else 0
     except Exception as e:
         logger.warning(f"Could not read last index for resume: {e}")
@@ -371,11 +413,43 @@ def chunk_iter_for(path: str, chunksize: int) -> Iterable[pd.DataFrame]:
 
 # ---------------------------- HTTP Client ----------------------------
 
+class RateLimiter:
+    """Token bucket rate limiter for API requests."""
+
+    def __init__(self, rate_limit: Optional[float]):
+        """
+        Initialize rate limiter.
+
+        Args:
+            rate_limit: Maximum requests per second (None = no limit)
+        """
+        self.rate_limit = rate_limit
+        self.last_request_time = 0.0
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        """Wait if necessary to respect rate limit."""
+        if self.rate_limit is None:
+            return
+
+        async with self.lock:
+            now = time.time()
+            time_since_last = now - self.last_request_time
+            min_interval = 1.0 / self.rate_limit
+
+            if time_since_last < min_interval:
+                wait_time = min_interval - time_since_last
+                await asyncio.sleep(wait_time)
+
+            self.last_request_time = time.time()
+
+
 class LakeraClient:
     """Async HTTP client for Lakera Guard API."""
-    
+
     def __init__(self, api_key: str, project_id: Optional[str], timeout_s: float,
-                 concurrency: int, retries: int, backoff_base: float, backoff_max: float):
+                 concurrency: int, retries: int, backoff_base: float, backoff_max: float,
+                 rate_limit: Optional[float] = None):
         self.api_key = api_key
         self.project_id = project_id
         self.timeout_s = timeout_s
@@ -384,6 +458,7 @@ class LakeraClient:
         self.backoff_max = backoff_max
         self.url = Config.API_URL
         self.sem = asyncio.Semaphore(concurrency)
+        self.rate_limiter = RateLimiter(rate_limit)
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self):
@@ -442,12 +517,15 @@ class LakeraClient:
     async def check(self, prompt: str) -> Dict:
         """Check prompt with retries and backoff."""
         async with self.sem:
+            # Apply rate limiting
+            await self.rate_limiter.acquire()
+
             # Add micro-jitter to prevent thundering herd
             await asyncio.sleep(random.uniform(0, 0.05))
-            
+
             delay = self.backoff_base
             last_error = None
-            
+
             for attempt in range(1, self.retries + 1):
                 try:
                     results, latency, err_text, status = await self._once(prompt)
@@ -490,6 +568,34 @@ class LakeraClient:
 
 # ---------------------------- Main processing ----------------------------
 
+def estimate_total_rows(path: str) -> Optional[int]:
+    """Estimate total rows in file for progress tracking."""
+    try:
+        ext = Path(path).suffix.lower()
+
+        if ext == ".csv":
+            # Quick line count for CSV
+            with open(path, 'rb') as f:
+                return sum(1 for _ in f) - 1  # Subtract header
+        elif ext == ".jsonl":
+            with open(path, 'rb') as f:
+                return sum(1 for _ in f)
+        elif ext == ".parquet":
+            try:
+                import pyarrow.parquet as pq
+                return pq.read_metadata(path).num_rows
+            except ImportError:
+                df = pd.read_parquet(path)
+                return len(df)
+        elif ext == ".json":
+            df = pd.read_json(path)
+            return len(df)
+    except Exception as e:
+        logger.debug(f"Could not estimate total rows: {e}")
+
+    return None
+
+
 async def process_file(
     path: str,
     api_key: str,
@@ -506,34 +612,50 @@ async def process_file(
     out_path: Path,
     resume: bool,
     show_progress: bool,
-    dataset_name: str
+    dataset_name: str,
+    rate_limit: Optional[float] = None
 ) -> None:
     """Process a single file with the Lakera API."""
-    
+
     logger.info(f"Processing {path} as dataset '{dataset_name}'")
-    
+
     total_written = 0
     header_written = out_path.exists() and out_path.stat().st_size > 0
     start_index = read_last_index_for_dataset(out_path, dataset_name) if resume else 0
-    
+
     if resume and start_index > 0:
         logger.info(f"Resuming from index {start_index}")
-    
+
     chunk_iter = chunk_iter_for(path, chunksize)
     detected_text = None
     detected_label = None
     global_index = 0
-    
+
+    # Estimate total rows for progress tracking
+    total_rows_estimate = estimate_total_rows(path)
+    if max_rows is not None:
+        total_rows_estimate = min(total_rows_estimate or max_rows, max_rows)
+
+    if total_rows_estimate and start_index > 0:
+        total_rows_estimate = max(0, total_rows_estimate - start_index)
+
     # Setup progress bar if requested
     pbar = None
+    start_time = time.time()
     if show_progress and TQDM_AVAILABLE:
         from tqdm import tqdm
-        pbar = tqdm(unit="rows", desc=f"Processing {Path(path).name}", leave=False)
+        pbar = tqdm(
+            total=total_rows_estimate,
+            unit="rows",
+            desc=f"Processing {Path(path).name}",
+            leave=False,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+        )
     
     try:
         async with LakeraClient(
-            api_key, project_id, timeout, concurrency, 
-            retries, backoff_base, backoff_max
+            api_key, project_id, timeout, concurrency,
+            retries, backoff_base, backoff_max, rate_limit
         ) as client:
             
             for df in chunk_iter:
@@ -618,9 +740,13 @@ async def process_file(
     finally:
         if pbar:
             pbar.close()
-    
+
+    # Log performance summary
+    elapsed = time.time() - start_time
+    throughput = total_written / elapsed if elapsed > 0 else 0
     logger.info(f"Completed {Path(path).name} -> {out_path} | "
-                f"dataset={dataset_name} | written rows: {total_written}")
+                f"dataset={dataset_name} | written rows: {total_written} | "
+                f"time: {elapsed:.1f}s | throughput: {throughput:.1f} rows/s")
 
 
 def write_confusion_summary(out_path: Path, summary_out: Optional[Path]) -> None:
@@ -738,7 +864,9 @@ Examples:
     parser.add_argument("--chunksize", type=int, default=Config.DEFAULT_CHUNK_SIZE,
                        help=f"Streaming chunk size (default: {Config.DEFAULT_CHUNK_SIZE})")
     parser.add_argument("--concurrency", type=int, default=Config.DEFAULT_CONCURRENCY,
-                       help=f"Concurrent HTTP requests (default: {Config.DEFAULT_CONCURRENCY})")
+                       help=f"Concurrent HTTP requests (default: {Config.DEFAULT_CONCURRENCY}). "
+                            f"Higher values (50-100) recommended for 100k+ datasets. "
+                            f"Lower (8-20) if hitting rate limits.")
     
     # Network configuration
     parser.add_argument("--timeout", type=float, default=Config.DEFAULT_TIMEOUT,
@@ -749,11 +877,17 @@ Examples:
                        help=f"Base backoff seconds (default: {Config.DEFAULT_BACKOFF_BASE})")
     parser.add_argument("--backoff-max", type=float, default=Config.DEFAULT_BACKOFF_MAX,
                        help=f"Max backoff seconds (default: {Config.DEFAULT_BACKOFF_MAX})")
+    parser.add_argument("--rate-limit", type=float, default=Config.DEFAULT_RATE_LIMIT,
+                       help="Rate limit in requests per second (default: None = no limit). "
+                            "Use to prevent API quota exhaustion (e.g., --rate-limit 10)")
     
     # Output configuration
     parser.add_argument("--output", help="Explicit output CSV path (merges all datasets)")
     parser.add_argument("--output-dir", default=Config.DEFAULT_OUTPUT_DIR,
                        help=f"Output directory (default: {Config.DEFAULT_OUTPUT_DIR})")
+    parser.add_argument("--output-prefix", default="lakera",
+                       help="Prefix for output filenames (default: lakera). "
+                            "Output format: {prefix}_{filename}_{timestamp}.csv")
     parser.add_argument("--resume", action="store_true",
                        help="Resume from last processed row (append mode)")
     parser.add_argument("--progress", action="store_true",
@@ -793,9 +927,9 @@ Examples:
     # Process each dataset
     try:
         for path in valid_files:
-            out_path = ensure_out_path(path, args.output_dir, args.output)
+            out_path = ensure_out_path(path, args.output_dir, args.output, args.output_prefix)
             dataset_name = args.dataset_name or Path(path).stem
-            
+
             logger.info(f"Starting processing of {path}")
             
             asyncio.run(process_file(
@@ -814,7 +948,8 @@ Examples:
                 out_path=out_path,
                 resume=args.resume,
                 show_progress=args.progress,
-                dataset_name=dataset_name
+                dataset_name=dataset_name,
+                rate_limit=args.rate_limit
             ))
             
     except KeyboardInterrupt:
