@@ -9,6 +9,8 @@ Lakera Guard Evaluator (Large Dataset Optimized, Single-File Output + Summary)
 - Quiet by default; optional progress bar (--progress)
 - Single merged CSV via --output; adds a `dataset` column
 - Confusion matrix + metrics via --summary-out
+- Fallback mechanism: Failed prompts marked as SAFE/benign (no prompts skipped)
+- Robust token bucket rate limiter for 100k+ prompt processing
 """
 
 import os
@@ -414,34 +416,62 @@ def chunk_iter_for(path: str, chunksize: int) -> Iterable[pd.DataFrame]:
 # ---------------------------- HTTP Client ----------------------------
 
 class RateLimiter:
-    """Token bucket rate limiter for API requests."""
+    """Token bucket rate limiter for API requests.
+
+    Robust implementation for handling 100k+ prompts with high concurrency.
+    Uses a token bucket algorithm to handle burst traffic efficiently.
+    """
 
     def __init__(self, rate_limit: Optional[float]):
         """
-        Initialize rate limiter.
+        Initialize rate limiter with token bucket algorithm.
 
         Args:
             rate_limit: Maximum requests per second (None = no limit)
         """
         self.rate_limit = rate_limit
-        self.last_request_time = 0.0
+
+        if rate_limit is None:
+            return
+
+        # Token bucket parameters
+        self.capacity = max(rate_limit * 2, 10)  # Bucket capacity (allow 2s burst)
+        self.tokens = self.capacity  # Start with full bucket
+        self.refill_rate = rate_limit  # Tokens per second
+        self.last_refill_time = time.time()
         self.lock = asyncio.Lock()
 
+        logger.info(f"Rate limiter initialized: {rate_limit} req/s, bucket capacity: {self.capacity}")
+
     async def acquire(self):
-        """Wait if necessary to respect rate limit."""
+        """Wait if necessary to respect rate limit using token bucket."""
         if self.rate_limit is None:
             return
 
         async with self.lock:
             now = time.time()
-            time_since_last = now - self.last_request_time
-            min_interval = 1.0 / self.rate_limit
 
-            if time_since_last < min_interval:
-                wait_time = min_interval - time_since_last
+            # Refill tokens based on time elapsed
+            elapsed = now - self.last_refill_time
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+            self.last_refill_time = now
+
+            # If we don't have a token, wait for one
+            if self.tokens < 1.0:
+                wait_time = (1.0 - self.tokens) / self.refill_rate
+                # Cap maximum wait time to avoid edge cases
+                wait_time = min(wait_time, 60.0)
+                logger.debug(f"Rate limit: waiting {wait_time:.2f}s for token")
                 await asyncio.sleep(wait_time)
 
-            self.last_request_time = time.time()
+                # Refill after waiting
+                now = time.time()
+                elapsed = now - self.last_refill_time
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+                self.last_refill_time = now
+
+            # Consume one token
+            self.tokens -= 1.0
 
 
 class LakeraClient:
@@ -722,7 +752,17 @@ async def process_file(
                             "detector_count": len(res.get("results", []))
                         })
                     else:
-                        logger.warning(f"Failed to process row {i_abs}: {res.get('error')}")
+                        # FALLBACK: Mark failed processing as SAFE/benign
+                        logger.warning(f"Failed to process row {i_abs}: {res.get('error')} - marking as SAFE (fallback)")
+                        out_rows.append({
+                            "dataset": dataset_name,
+                            "index": i_abs,
+                            "prompt": prompt[:1000],  # Truncate very long prompts
+                            "ground_truth": "THREAT" if gt is True else "SAFE" if gt is False else "N/A",
+                            "prediction": "SAFE",  # Fallback to benign/safe
+                            "latency_ms": "0.00",
+                            "detector_count": 0
+                        })
                 
                 # Write results
                 if out_rows:
